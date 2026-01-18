@@ -147,4 +147,40 @@ describe("buildEmbeddedRunPayloads", () => {
     expect(payloads).toHaveLength(1);
     expect(payloads[0]?.text).toBe("All good");
   });
+
+  it("adds tool error fallback when assistant output is NO_REPLY", () => {
+    const payloads = buildEmbeddedRunPayloads({
+      assistantTexts: ["NO_REPLY"],
+      toolMetas: [],
+      lastAssistant: { stopReason: "end_turn" } as AssistantMessage,
+      lastToolError: { toolName: "browser", error: "tab not found" },
+      sessionKey: "session:telegram",
+      inlineToolResultsAllowed: false,
+      verboseLevel: "off",
+      reasoningLevel: "off",
+      toolResultFormat: "plain",
+    });
+
+    expect(payloads).toHaveLength(1);
+    expect(payloads[0]?.isError).toBe(true);
+    expect(payloads[0]?.text).toContain("browser");
+    expect(payloads[0]?.text).toContain("tab not found");
+  });
+
+  it("skips tool error fallback when messaging tool already sent", () => {
+    const payloads = buildEmbeddedRunPayloads({
+      assistantTexts: [],
+      toolMetas: [],
+      lastAssistant: undefined,
+      lastToolError: { toolName: "browser", error: "tab not found" },
+      didSendViaMessagingTool: true,
+      sessionKey: "session:telegram",
+      inlineToolResultsAllowed: false,
+      verboseLevel: "off",
+      reasoningLevel: "off",
+      toolResultFormat: "plain",
+    });
+
+    expect(payloads).toHaveLength(0);
+  });
 });

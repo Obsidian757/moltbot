@@ -17,6 +17,7 @@ Docs: https://docs.clawd.bot
 - macOS: avoid touching launchd in Remote over SSH so quitting the app no longer disables the remote gateway. (#1105)
 - Memory: index atomically so failed reindex preserves the previous memory database. (#1151) — thanks @gumadeiras.
 - Memory: avoid sqlite-vec unique constraint failures when reindexing duplicate chunk ids. (#1151) — thanks @gumadeiras.
+- Agents: surface tool failures when no assistant output is emitted. (#1175) — thanks @vrknetha.
 
 ## 2026.1.18-3
 

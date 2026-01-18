@@ -24,6 +24,7 @@ export function buildEmbeddedRunPayloads(params: {
   toolMetas: ToolMetaEntry[];
   lastAssistant: AssistantMessage | undefined;
   lastToolError?: { toolName: string; meta?: string; error?: string };
+  didSendViaMessagingTool?: boolean;
   config?: ClawdbotConfig;
   sessionKey: string;
   verboseLevel?: VerboseLevel;
@@ -156,34 +157,46 @@ export function buildEmbeddedRunPayloads(params: {
     });
   }
 
-  if (replyItems.length === 0 && params.lastToolError) {
+  const buildPayloads = (items: typeof replyItems) => {
+    const hasAudioAsVoiceTag = items.some((item) => item.audioAsVoice);
+    return items
+      .map((item) => ({
+        text: item.text?.trim() ? item.text.trim() : undefined,
+        mediaUrls: item.media?.length ? item.media : undefined,
+        mediaUrl: item.media?.[0],
+        isError: item.isError,
+        replyToId: item.replyToId,
+        replyToTag: item.replyToTag,
+        replyToCurrent: item.replyToCurrent,
+        audioAsVoice: item.audioAsVoice || Boolean(hasAudioAsVoiceTag && item.media?.length),
+      }))
+      .filter((p) => {
+        if (!p.text && !p.mediaUrl && (!p.mediaUrls || p.mediaUrls.length === 0)) return false;
+        if (p.text && isSilentReplyText(p.text, SILENT_REPLY_TOKEN)) return false;
+        return true;
+      });
+  };
+
+  let payloads = buildPayloads(replyItems);
+
+  if (
+    payloads.length === 0 &&
+    params.lastToolError &&
+    params.didSendViaMessagingTool !== true
+  ) {
     const toolSummary = formatToolAggregate(
       params.lastToolError.toolName,
       params.lastToolError.meta ? [params.lastToolError.meta] : undefined,
       { markdown: useMarkdown },
     );
     const errorSuffix = params.lastToolError.error ? `: ${params.lastToolError.error}` : "";
-    replyItems.push({
-      text: `⚠️ ${toolSummary} failed${errorSuffix}`,
-      isError: true,
-    });
+    payloads = buildPayloads([
+      {
+        text: `⚠️ ${toolSummary} failed${errorSuffix}`,
+        isError: true,
+      },
+    ]);
   }
 
-  const hasAudioAsVoiceTag = replyItems.some((item) => item.audioAsVoice);
-  return replyItems
-    .map((item) => ({
-      text: item.text?.trim() ? item.text.trim() : undefined,
-      mediaUrls: item.media?.length ? item.media : undefined,
-      mediaUrl: item.media?.[0],
-      isError: item.isError,
-      replyToId: item.replyToId,
-      replyToTag: item.replyToTag,
-      replyToCurrent: item.replyToCurrent,
-      audioAsVoice: item.audioAsVoice || Boolean(hasAudioAsVoiceTag && item.media?.length),
-    }))
-    .filter((p) => {
-      if (!p.text && !p.mediaUrl && (!p.mediaUrls || p.mediaUrls.length === 0)) return false;
-      if (p.text && isSilentReplyText(p.text, SILENT_REPLY_TOKEN)) return false;
-      return true;
-    });
+  return payloads;
 }

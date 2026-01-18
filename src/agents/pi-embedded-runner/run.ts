@@ -432,6 +432,7 @@ export async function runEmbeddedPiAgent(
             toolMetas: attempt.toolMetas,
             lastAssistant: attempt.lastAssistant,
             lastToolError: attempt.lastToolError,
+            didSendViaMessagingTool: attempt.didSendViaMessagingTool,
             config: params.config,
             sessionKey: params.sessionKey ?? params.sessionId,
             verboseLevel: params.verboseLevel,
