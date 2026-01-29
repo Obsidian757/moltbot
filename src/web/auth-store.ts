@@ -10,6 +10,21 @@ import { defaultRuntime, type RuntimeEnv } from "../runtime.js";
 import { formatCliCommand } from "../cli/command-format.js";
 import type { WebChannel } from "../utils.js";
 import { jidToE164, resolveUserPath } from "../utils.js";
+import {
+  decrypt,
+  encrypt,
+  isEncrypted,
+  type EncryptedData,
+  type EncryptionConfig,
+} from "../security/credential-encryption.js";
+
+/** Configuration for credential encryption */
+export type WebAuthEncryptionOptions = {
+  /** Enable encryption for credential storage */
+  enabled: boolean;
+  /** Custom encryption configuration */
+  config?: EncryptionConfig;
+};
 
 export function resolveDefaultWebAuthDir(): string {
   return path.join(resolveOAuthDir(), "whatsapp", DEFAULT_ACCOUNT_ID);
@@ -45,6 +60,118 @@ function readCredsJsonRaw(filePath: string): string | null {
   }
 }
 
+/**
+ * Read credentials from file, automatically handling encrypted or plain format.
+ */
+export async function readWebCreds<T = unknown>(
+  authDir: string,
+  encryptionConfig?: EncryptionConfig,
+): Promise<T | null> {
+  const credsPath = resolveWebCredsPath(resolveUserPath(authDir));
+  try {
+    const raw = await fs.readFile(credsPath, "utf-8");
+    const parsed = JSON.parse(raw);
+
+    if (isEncrypted(parsed)) {
+      const decrypted = await decrypt(parsed, encryptionConfig);
+      return JSON.parse(decrypted) as T;
+    }
+
+    return parsed as T;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Write credentials to file with optional encryption.
+ */
+export async function writeWebCreds(
+  authDir: string,
+  data: unknown,
+  options?: WebAuthEncryptionOptions,
+): Promise<void> {
+  const resolvedAuthDir = resolveUserPath(authDir);
+  const credsPath = resolveWebCredsPath(resolvedAuthDir);
+
+  await fs.mkdir(resolvedAuthDir, { recursive: true, mode: 0o700 });
+
+  if (options?.enabled) {
+    const plaintext = JSON.stringify(data, null, 2);
+    const encrypted = await encrypt(plaintext, options.config);
+    await fs.writeFile(credsPath, JSON.stringify(encrypted, null, 2), { mode: 0o600 });
+  } else {
+    await fs.writeFile(credsPath, JSON.stringify(data, null, 2), { mode: 0o600 });
+  }
+}
+
+/**
+ * Check if credentials are currently stored in encrypted format.
+ */
+export function isWebCredsEncrypted(authDir: string): boolean {
+  try {
+    const credsPath = resolveWebCredsPath(resolveUserPath(authDir));
+    const raw = readCredsJsonRaw(credsPath);
+    if (!raw) return false;
+    const parsed = JSON.parse(raw);
+    return isEncrypted(parsed);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Migrate unencrypted credentials to encrypted format.
+ * Creates a backup of the original unencrypted file.
+ */
+export async function migrateWebCredsToEncrypted(
+  authDir: string,
+  encryptionConfig?: EncryptionConfig,
+): Promise<{ migrated: boolean; backupPath?: string }> {
+  const logger = getChildLogger({ module: "web-session" });
+  const resolvedAuthDir = resolveUserPath(authDir);
+  const credsPath = resolveWebCredsPath(resolvedAuthDir);
+
+  try {
+    const raw = await fs.readFile(credsPath, "utf-8");
+    const parsed = JSON.parse(raw);
+
+    // Already encrypted
+    if (isEncrypted(parsed)) {
+      return { migrated: false };
+    }
+
+    // Create backup of unencrypted file
+    const backupPath = path.join(resolvedAuthDir, "creds.unencrypted.bak");
+    await fs.copyFile(credsPath, backupPath);
+    await fs.chmod(backupPath, 0o600);
+
+    // Write encrypted version
+    await writeWebCreds(authDir, parsed, { enabled: true, config: encryptionConfig });
+
+    logger.info({ credsPath }, "migrated WhatsApp credentials to encrypted format");
+    return { migrated: true, backupPath };
+  } catch (err) {
+    logger.error({ err, credsPath }, "failed to migrate credentials to encrypted format");
+    return { migrated: false };
+  }
+}
+
+/**
+ * Securely delete the unencrypted backup after successful migration.
+ */
+export async function deleteUnencryptedBackup(authDir: string): Promise<boolean> {
+  const resolvedAuthDir = resolveUserPath(authDir);
+  const backupPath = path.join(resolvedAuthDir, "creds.unencrypted.bak");
+
+  try {
+    await fs.rm(backupPath, { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function maybeRestoreCredsFromBackup(authDir: string): void {
   const logger = getChildLogger({ module: "web-session" });
   try {
@@ -69,7 +196,10 @@ export function maybeRestoreCredsFromBackup(authDir: string): void {
   }
 }
 
-export async function webAuthExists(authDir: string = resolveDefaultWebAuthDir()) {
+export async function webAuthExists(
+  authDir: string = resolveDefaultWebAuthDir(),
+  encryptionConfig?: EncryptionConfig,
+) {
   const resolvedAuthDir = resolveUserPath(authDir);
   maybeRestoreCredsFromBackup(resolvedAuthDir);
   const credsPath = resolveWebCredsPath(resolvedAuthDir);
@@ -82,7 +212,20 @@ export async function webAuthExists(authDir: string = resolveDefaultWebAuthDir()
     const stats = await fs.stat(credsPath);
     if (!stats.isFile() || stats.size <= 1) return false;
     const raw = await fs.readFile(credsPath, "utf-8");
-    JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+
+    // Handle encrypted credentials
+    if (isEncrypted(parsed)) {
+      try {
+        await decrypt(parsed, encryptionConfig);
+        return true;
+      } catch {
+        // Decryption failed - credentials exist but can't be read
+        return false;
+      }
+    }
+
+    // Plain credentials are valid if parseable
     return true;
   } catch {
     return false;
@@ -129,18 +272,46 @@ export async function logoutWeb(params: {
 
 export function readWebSelfId(authDir: string = resolveDefaultWebAuthDir()) {
   // Read the cached WhatsApp Web identity (jid + E.164) from disk if present.
+  // Note: This is synchronous and does not support encrypted credentials.
+  // Use readWebSelfIdAsync for encrypted credential support.
   try {
     const credsPath = resolveWebCredsPath(resolveUserPath(authDir));
     if (!fsSync.existsSync(credsPath)) {
       return { e164: null, jid: null } as const;
     }
     const raw = fsSync.readFileSync(credsPath, "utf-8");
-    const parsed = JSON.parse(raw) as { me?: { id?: string } } | undefined;
+    const parsed = JSON.parse(raw) as { me?: { id?: string }; version?: number } | undefined;
+
+    // Skip if encrypted (version field indicates encrypted format)
+    if (parsed && "version" in parsed && parsed.version === 1) {
+      return { e164: null, jid: null, encrypted: true } as const;
+    }
+
     const jid = parsed?.me?.id ?? null;
     const e164 = jid ? jidToE164(jid, { authDir }) : null;
     return { e164, jid } as const;
   } catch {
     return { e164: null, jid: null } as const;
+  }
+}
+
+/**
+ * Async version of readWebSelfId that supports encrypted credentials.
+ */
+export async function readWebSelfIdAsync(
+  authDir: string = resolveDefaultWebAuthDir(),
+  encryptionConfig?: EncryptionConfig,
+): Promise<{ e164: string | null; jid: string | null }> {
+  try {
+    const creds = await readWebCreds<{ me?: { id?: string } }>(authDir, encryptionConfig);
+    if (!creds) {
+      return { e164: null, jid: null };
+    }
+    const jid = creds.me?.id ?? null;
+    const e164 = jid ? jidToE164(jid, { authDir }) : null;
+    return { e164, jid };
+  } catch {
+    return { e164: null, jid: null };
   }
 }
 

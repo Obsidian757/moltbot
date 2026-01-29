@@ -1,8 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, beforeEach } from "vitest";
 
 import { authorizeGatewayConnect } from "./auth.js";
+import { __resetGatewayRateLimiterForTest } from "../security/rate-limiter.js";
 
 describe("gateway auth", () => {
+  beforeEach(() => {
+    __resetGatewayRateLimiterForTest();
+  });
   it("does not throw when req is missing socket", async () => {
     const res = await authorizeGatewayConnect({
       auth: { mode: "token", token: "secret", allowTailscale: false },

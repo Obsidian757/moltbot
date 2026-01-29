@@ -3,6 +3,11 @@ import type { IncomingMessage } from "node:http";
 import type { GatewayAuthConfig, GatewayTailscaleMode } from "../config/config.js";
 import { readTailscaleWhoisIdentity, type TailscaleWhoisIdentity } from "../infra/tailscale.js";
 import { isTrustedProxyAddress, parseForwardedForClientIp, resolveGatewayClientIp } from "./net.js";
+import {
+  extractRateLimitKey,
+  getGatewayRateLimiter,
+  type RateLimitResult,
+} from "../security/rate-limiter.js";
 export type ResolvedGatewayAuthMode = "token" | "password";
 
 export type ResolvedGatewayAuth = {
@@ -17,6 +22,7 @@ export type GatewayAuthResult = {
   method?: "token" | "password" | "tailscale" | "device-token";
   user?: string;
   reason?: string;
+  rateLimit?: RateLimitResult;
 };
 
 type ConnectAuth = {
@@ -202,10 +208,46 @@ export async function authorizeGatewayConnect(params: {
   req?: IncomingMessage;
   trustedProxies?: string[];
   tailscaleWhois?: TailscaleWhoisLookup;
+  /** Skip rate limiting (for testing or trusted contexts) */
+  skipRateLimit?: boolean;
 }): Promise<GatewayAuthResult> {
-  const { auth, connectAuth, req, trustedProxies } = params;
+  const { auth, connectAuth, req, trustedProxies, skipRateLimit } = params;
   const tailscaleWhois = params.tailscaleWhois ?? readTailscaleWhoisIdentity;
   const localDirect = isLocalDirectRequest(req, trustedProxies);
+
+  // Extract rate limit key from request
+  const rateLimitKey = extractRateLimitKey({
+    remoteAddress: req?.socket?.remoteAddress,
+    forwardedFor: headerValue(req?.headers?.["x-forwarded-for"]),
+    trustedProxies,
+  });
+
+  const rateLimiter = getGatewayRateLimiter();
+
+  // Check rate limit before processing (skip for local direct requests)
+  if (!skipRateLimit && !localDirect) {
+    const rateLimitCheck = rateLimiter.check(rateLimitKey);
+    if (!rateLimitCheck.allowed) {
+      return {
+        ok: false,
+        reason: rateLimitCheck.reason === "locked_out" ? "rate_limit_lockout" : "rate_limited",
+        rateLimit: rateLimitCheck,
+      };
+    }
+  }
+
+  // Helper to record auth result and return
+  const recordAndReturn = (result: GatewayAuthResult): GatewayAuthResult => {
+    if (!skipRateLimit && !localDirect) {
+      if (result.ok) {
+        rateLimiter.recordSuccess(rateLimitKey);
+      } else {
+        const rateResult = rateLimiter.recordFailure(rateLimitKey);
+        result.rateLimit = rateResult;
+      }
+    }
+    return result;
+  };
 
   if (auth.allowTailscale && !localDirect) {
     const tailscaleCheck = await resolveVerifiedTailscaleUser({
@@ -213,40 +255,40 @@ export async function authorizeGatewayConnect(params: {
       tailscaleWhois,
     });
     if (tailscaleCheck.ok) {
-      return {
+      return recordAndReturn({
         ok: true,
         method: "tailscale",
         user: tailscaleCheck.user.login,
-      };
+      });
     }
   }
 
   if (auth.mode === "token") {
     if (!auth.token) {
-      return { ok: false, reason: "token_missing_config" };
+      return recordAndReturn({ ok: false, reason: "token_missing_config" });
     }
     if (!connectAuth?.token) {
-      return { ok: false, reason: "token_missing" };
+      return recordAndReturn({ ok: false, reason: "token_missing" });
     }
     if (!safeEqual(connectAuth.token, auth.token)) {
-      return { ok: false, reason: "token_mismatch" };
+      return recordAndReturn({ ok: false, reason: "token_mismatch" });
     }
-    return { ok: true, method: "token" };
+    return recordAndReturn({ ok: true, method: "token" });
   }
 
   if (auth.mode === "password") {
     const password = connectAuth?.password;
     if (!auth.password) {
-      return { ok: false, reason: "password_missing_config" };
+      return recordAndReturn({ ok: false, reason: "password_missing_config" });
     }
     if (!password) {
-      return { ok: false, reason: "password_missing" };
+      return recordAndReturn({ ok: false, reason: "password_missing" });
     }
     if (!safeEqual(password, auth.password)) {
-      return { ok: false, reason: "password_mismatch" };
+      return recordAndReturn({ ok: false, reason: "password_mismatch" });
     }
-    return { ok: true, method: "password" };
+    return recordAndReturn({ ok: true, method: "password" });
   }
 
-  return { ok: false, reason: "unauthorized" };
+  return recordAndReturn({ ok: false, reason: "unauthorized" });
 }
